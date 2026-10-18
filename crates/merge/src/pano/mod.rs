@@ -223,9 +223,10 @@ pub fn stitch(frames: Vec<Frame>, opts: &PanoOptions, progress: &Progress) -> Re
     stitch_with_output_pixel_limit(frames, opts, usize::MAX, progress)
 }
 
-/// Stitch a panorama only if its padded output canvas fits within `max_output_pixels`.
+/// Stitch a panorama scaled so its padded output canvas fits within `max_output_pixels`.
 ///
-/// The check runs after projection geometry is known and before tile or blend buffers are allocated.
+/// The scale accounts for the output border and tile padding after projection geometry is known.
+/// A final limit check runs before tile or blend buffers are allocated.
 pub fn stitch_with_output_pixel_limit(
     mut frames: Vec<Frame>,
     opts: &PanoOptions,
@@ -254,14 +255,45 @@ pub fn stitch_with_output_pixel_limit(
     }
     // output scale: native resolution, limited to max_megapixels and the longest edge
     let max_px = if opts.max_megapixels.is_nan() { MAX_MEGAPIXELS } else { opts.max_megapixels.clamp(0.1, MAX_MEGAPIXELS) } * 1e6;
-    let s = (max_px / ((bx1 - bx0) * (by1 - by0))).sqrt().min(MAX_EDGE / (bx1 - bx0).max(by1 - by0)).min(1.0);
+    let canvas_at_scale = |scale: f64| -> Option<(usize, usize, usize)> {
+        let width = ((bx1 - bx0) * scale).ceil();
+        let height = ((by1 - by0) * scale).ceil();
+        if !width.is_finite() || !height.is_finite() || width < 0.0 || height < 0.0 {
+            return None;
+        }
+        let cw = (width as usize).checked_add(1)?;
+        let ch = (height as usize).checked_add(1)?;
+        let levels = ((cw.min(ch) as f64).log2() - 3.0).floor().clamp(1.0, 7.0) as usize;
+        let unit = 1usize.checked_shl(u32::try_from(levels).ok()?)?;
+        let pw = cw.div_ceil(unit).checked_mul(unit)?;
+        let ph = ch.div_ceil(unit).checked_mul(unit)?;
+        let output_pixels = pw.checked_mul(ph)?;
+        Some((pw, ph, output_pixels))
+    };
+    let mut s = (max_px / ((bx1 - bx0) * (by1 - by0))).sqrt().min(MAX_EDGE / (bx1 - bx0).max(by1 - by0)).min(1.0);
+    let Some((mut pw, mut ph, mut output_pixels)) = canvas_at_scale(s) else {
+        return Err(MergeError::NoOverlap("the panorama output dimensions overflow".into()));
+    };
+    if output_pixels > max_output_pixels {
+        // Find the largest scale whose canvas, including its +1 border and multiband tile padding,
+        // fits the caller's memory limit. The final check below remains a guard against regressions.
+        let (mut low, mut high) = (0.0, s);
+        for _ in 0..64 {
+            let candidate = low + (high - low) * 0.5;
+            if canvas_at_scale(candidate).is_some_and(|dims| dims.2 <= max_output_pixels) {
+                low = candidate;
+            } else {
+                high = candidate;
+            }
+        }
+        s = low;
+        let Some(dims) = canvas_at_scale(s) else {
+            return Err(MergeError::NoOverlap("the panorama output dimensions overflow".into()));
+        };
+        (pw, ph, output_pixels) = dims;
+    }
     let f_out = fmed * s;
     let (ox, oy) = (bx0 * s, by0 * s);
-    let (cw, ch) = (((bx1 - bx0) * s).ceil() as usize + 1, ((by1 - by0) * s).ceil() as usize + 1);
-    let levels = ((cw.min(ch) as f64).log2() - 3.0).floor().clamp(1.0, 7.0) as usize;
-    let unit = 1usize << levels;
-    let (pw, ph) = (cw.div_ceil(unit) * unit, ch.div_ceil(unit) * unit);
-    let output_pixels = pw.checked_mul(ph).ok_or_else(|| MergeError::NoOverlap("the panorama output dimensions overflow".into()))?;
     if output_pixels > max_output_pixels {
         return Err(MergeError::NoOverlap(format!(
             "the projected panorama needs {output_pixels} output pixels, above the Photo Merge memory limit of {max_output_pixels}; lower the panorama size or select fewer photos"
