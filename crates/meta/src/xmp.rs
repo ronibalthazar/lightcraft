@@ -526,6 +526,11 @@ pub(crate) fn extended_xmp_reference(data: &XmpData) -> Result<Option<String>, S
 
 fn merge_xmp_value(preferred: &XmpValue, fallback: &XmpValue) -> XmpValue {
     match (preferred, fallback) {
+        (XmpValue::Array(preferred), XmpValue::Array(fallback)) => {
+            let mut merged = preferred.clone();
+            merged.extend(fallback.iter().cloned());
+            XmpValue::Array(merged)
+        }
         (XmpValue::Struct(preferred), XmpValue::Struct(fallback)) => {
             let mut merged = fallback.clone();
             for (key, value) in preferred {
@@ -839,6 +844,23 @@ mod tests {
         let d = parse_xmp(&x).unwrap();
         assert_eq!(d.metadata, Metadata::default());
         assert_eq!(d.lc_settings, None);
+    }
+
+    #[test]
+    fn merge_xmp_arrays_preserves_preferred_then_fallback_items() {
+        let preferred = XmpValue::Array(vec![XmpValue::Text("standard-1".into()), XmpValue::Text("standard-2".into())]);
+        let fallback = XmpValue::Array(vec![XmpValue::Text("extended-1".into()), XmpValue::Text("extended-2".into())]);
+
+        assert_eq!(
+            merge_xmp_value(&preferred, &fallback),
+            XmpValue::Array(vec![
+                XmpValue::Text("standard-1".into()),
+                XmpValue::Text("standard-2".into()),
+                XmpValue::Text("extended-1".into()),
+                XmpValue::Text("extended-2".into()),
+            ])
+        );
+        assert_eq!(merge_xmp_value(&preferred, &XmpValue::Text("fallback".into())), preferred);
     }
 
     #[test]
