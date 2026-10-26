@@ -1837,7 +1837,8 @@ impl PreparedExport {
                     if remove_location {
                         let metadata = lightcraft_meta::try_extract(&bytes)
                             .map_err(|e| format!("{label}: can't verify location metadata in this original file: {e}"))?;
-                        if metadata.gps.is_some() {
+                        let embeds_xmp_gps = original_embeds_xmp_gps(&bytes, &label)?;
+                        if metadata.gps.is_some() || embeds_xmp_gps {
                             return Err(format!(
                                 "{label}: can't remove the location from an original file that embeds GPS; export as JPEG, TIFF or DNG instead"
                             ));
@@ -1872,6 +1873,19 @@ impl PreparedExport {
             }
         }
     }
+}
+
+/// Recognized raw XMP GPS properties still make an Original unsafe to copy when their values are
+/// malformed and therefore cannot be projected into `Metadata`. Parse canonical properties from
+/// the source packet; don't infer metadata from XML substrings. A packet that can't be inspected
+/// fails closed, like the existing extraction guard above.
+fn original_embeds_xmp_gps(bytes: &[u8], label: &str) -> Result<bool, String> {
+    let Some(packet) = lightcraft_meta::embedded(bytes).xmp else { return Ok(false) };
+    let xmp = lightcraft_meta::parse_xmp(&packet)
+        .map_err(|e| format!("{label}: can't verify location metadata in this original file: malformed embedded XMP: {e}"))?;
+    Ok(["exif:GPSLatitude", "exif:GPSLongitude"]
+        .into_iter()
+        .any(|key| xmp.properties.get(key).is_some_and(|values| values.iter().any(|value| !value.trim().is_empty()))))
 }
 
 /// How an exported DNG stores its raw data.
