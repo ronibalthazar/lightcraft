@@ -1876,16 +1876,23 @@ impl PreparedExport {
 }
 
 /// Recognized raw XMP GPS properties still make an Original unsafe to copy when their values are
-/// malformed and therefore cannot be projected into `Metadata`. Parse canonical properties from
-/// the source packet; don't infer metadata from XML substrings. A packet that can't be inspected
-/// fails closed, like the existing extraction guard above.
+/// malformed and therefore cannot be projected into `Metadata`. Inspect both standard and
+/// Extended XMP packets from the source bytes; don't infer metadata from XML substrings. A packet
+/// that can't be inspected or has a truncated property map fails closed.
 fn original_embeds_xmp_gps(bytes: &[u8], label: &str) -> Result<bool, String> {
-    let Some(packet) = lightcraft_meta::embedded(bytes).xmp else { return Ok(false) };
-    let xmp = lightcraft_meta::parse_xmp(&packet)
-        .map_err(|e| format!("{label}: can't verify location metadata in this original file: malformed embedded XMP: {e}"))?;
-    Ok(["exif:GPSLatitude", "exif:GPSLongitude"]
-        .into_iter()
-        .any(|key| xmp.properties.get(key).is_some_and(|values| values.iter().any(|value| !value.trim().is_empty()))))
+    let embedded = lightcraft_meta::embedded(bytes);
+    let mut found_gps = false;
+    for packet in [embedded.xmp.as_deref(), embedded.xmp_extended.as_deref()].into_iter().flatten() {
+        let xmp = lightcraft_meta::parse_xmp(packet)
+            .map_err(|e| format!("{label}: can't verify location metadata in this original file: malformed embedded XMP: {e}"))?;
+        if xmp.properties_truncated {
+            return Err(format!("{label}: can't verify location metadata in this original file: embedded XMP property limit was exceeded"));
+        }
+        found_gps |= ["exif:GPSLatitude", "exif:GPSLongitude"]
+            .into_iter()
+            .any(|key| xmp.properties.get(key).is_some_and(|values| values.iter().any(|value| !value.trim().is_empty())));
+    }
+    Ok(found_gps)
 }
 
 /// How an exported DNG stores its raw data.
@@ -2451,6 +2458,75 @@ mod tests {
             let b = encode_image(&img, &ExportOptions { format: f, ..Default::default() }).unwrap();
             assert!(b.starts_with(magic), "{f:?}");
         }
+    }
+
+    fn xmp_with_gps() -> String {
+        r#"<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"><rdf:Description xmlns:exif="http://ns.adobe.com/exif/1.0/" exif:GPSLatitude="45,0N" exif:GPSLongitude="7,0E"/></rdf:RDF>"#.into()
+    }
+
+    fn jpeg_with_extended_xmp(packet: &str) -> Vec<u8> {
+        let image = test_image();
+        let mut jpeg = lightcraft_codecs::encode_jpeg(&EncodeImage::rgba8(&image), 90, ChromaSubsampling::S444, &EncodeMeta::default()).unwrap();
+        let scan = jpeg.windows(2).position(|window| window == [0xff, 0xda]).unwrap();
+        let mut payload = b"http://ns.adobe.com/xmp/extension/\0".to_vec();
+        payload.extend_from_slice(b"0123456789ABCDEF0123456789ABCDEF");
+        payload.extend_from_slice(&(packet.len() as u32).to_be_bytes());
+        payload.extend_from_slice(&0u32.to_be_bytes());
+        payload.extend_from_slice(packet.as_bytes());
+        let length = u16::try_from(payload.len() + 2).unwrap().to_be_bytes();
+        let mut segment = vec![0xff, 0xe1, length[0], length[1]];
+        segment.extend_from_slice(&payload);
+        jpeg.splice(scan..scan, segment);
+        jpeg
+    }
+
+    fn png_with_gps_after_xmp_key_budget() -> Vec<u8> {
+        let level = "n".repeat(200);
+        let mut packet = String::from(
+            "<rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\" xmlns:lc=\"http://ns.lightcraft.app/lc/1.0/\" xmlns:exif=\"http://ns.adobe.com/exif/1.0/\"><rdf:Description><lc:root rdf:parseType=\"Resource\">",
+        );
+        for _ in 0..4 {
+            packet.push_str(&format!("<lc:{level} rdf:parseType=\"Resource\">"));
+        }
+        for index in 0..1600 {
+            packet.push_str(&format!("<lc:leaf{index}>v</lc:leaf{index}>"));
+        }
+        for _ in 0..4 {
+            packet.push_str(&format!("</lc:{level}>"));
+        }
+        packet.push_str("</lc:root>");
+        let tail = "t".repeat(77);
+        packet.push_str(&format!("<lc:{tail}>v</lc:{tail}><exif:GPSLatitude>45,0N</exif:GPSLatitude></rdf:Description></rdf:RDF>"));
+        let image = test_image();
+        lightcraft_codecs::encode_png(&EncodeImage::rgba8(&image), &EncodeMeta { xmp: Some(&packet), ..Default::default() }).unwrap()
+    }
+
+    #[test]
+    fn original_xmp_gps_guard_checks_extended_packets() {
+        let packet = xmp_with_gps();
+        let bytes = jpeg_with_extended_xmp(&packet);
+        assert_eq!(lightcraft_meta::embedded(&bytes).xmp_extended.as_deref(), Some(packet.as_str()));
+        assert!(original_embeds_xmp_gps(&bytes, "test.jpg").unwrap());
+    }
+
+    #[test]
+    fn original_xmp_gps_guard_rejects_unreadable_extended_packets() {
+        let bytes = jpeg_with_extended_xmp("<x:xmpmeta><broken");
+        assert!(original_embeds_xmp_gps(&bytes, "test.jpg").is_err());
+    }
+
+    #[test]
+    fn original_xmp_gps_guard_fails_closed_when_properties_are_truncated() {
+        let bytes = png_with_gps_after_xmp_key_budget();
+        let packet = lightcraft_meta::embedded(&bytes).xmp.unwrap();
+        let parsed = lightcraft_meta::parse_xmp(&packet).unwrap();
+        assert!(
+            !parsed.properties.contains_key("exif:GPSLatitude"),
+            "fixture reaches the key budget before GPS; keys={} bytes={}",
+            parsed.properties.len(),
+            parsed.properties.keys().map(String::len).sum::<usize>()
+        );
+        assert!(original_embeds_xmp_gps(&bytes, "test.png").is_err());
     }
 
     #[test]
